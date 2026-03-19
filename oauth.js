@@ -17,11 +17,11 @@ const LOGIN_PAGE_HTML = `<!DOCTYPE html>
 </head>
 <body>
     <h2>Authorize MCP Access</h2>
-    <p>Enter the server password to grant access to Google Classroom data.</p>
+    <p>Enter your password to grant access to your Google Classroom data.</p>
     {{ERROR}}
     <form method="POST" action="/login">
         <input type="hidden" name="session" value="{{SESSION_ID}}">
-        <input type="password" name="password" placeholder="Server password" required autofocus>
+        <input type="password" name="password" placeholder="Your password" required autofocus>
         <button type="submit">Authorize</button>
     </form>
 </body>
@@ -40,9 +40,8 @@ function safeCompare(a, b) {
 }
 
 class SimpleOAuthProvider {
-  constructor(password) {
-    this.password = password;
-    this.signingKey = password;
+  constructor(signingKey) {
+    this.signingKey = signingKey;
     this.clients = new Map();
     this.authCodes = new Map();
     this.pendingAuth = new Map();
@@ -94,12 +93,12 @@ class SimpleOAuthProvider {
     return sessionId;
   }
 
-  completeAuthorize(sessionId) {
+  completeAuthorize(sessionId, userId) {
     const pending = this.pendingAuth.get(sessionId);
     if (!pending) return null;
     this.pendingAuth.delete(sessionId);
     const code = crypto.randomBytes(32).toString('base64url');
-    this.authCodes.set(code, { ...pending, expiresAt: Math.floor(Date.now() / 1000) + 300 });
+    this.authCodes.set(code, { ...pending, userId, expiresAt: Math.floor(Date.now() / 1000) + 300 });
     return { code, redirectUri: pending.redirectUri, state: pending.state };
   }
 
@@ -112,13 +111,13 @@ class SimpleOAuthProvider {
     if (authCode.redirectUri !== redirectUri) return { error: 'invalid_grant' };
     const expected = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
     if (expected !== authCode.codeChallenge) return { error: 'invalid_grant' };
-    return { tokens: this._issueTokens(clientId, authCode.scopes) };
+    return { tokens: this._issueTokens(clientId, authCode.scopes, authCode.userId) };
   }
 
   refresh(refreshTokenStr, clientId) {
     const payload = this._verifyToken(refreshTokenStr);
     if (!payload || payload.type !== 'refresh') return { error: 'invalid_grant' };
-    return { tokens: this._issueTokens(clientId, payload.scopes || []) };
+    return { tokens: this._issueTokens(clientId, payload.scopes || [], payload.user_id) };
   }
 
   validateToken(token) {
@@ -127,27 +126,43 @@ class SimpleOAuthProvider {
     return payload;
   }
 
-  _issueTokens(clientId, scopes) {
+  _issueTokens(clientId, scopes, userId) {
     const now = Math.floor(Date.now() / 1000);
     const result = {
-      access_token: this._signToken({ client_id: clientId, exp: now + 86400, scopes, type: 'access' }),
+      access_token: this._signToken({ client_id: clientId, exp: now + 86400, scopes, type: 'access', user_id: userId }),
       token_type: 'bearer',
       expires_in: 86400,
-      refresh_token: this._signToken({ client_id: clientId, exp: now + 86400 * 30, scopes, type: 'refresh' }),
+      refresh_token: this._signToken({ client_id: clientId, exp: now + 86400 * 30, scopes, type: 'refresh', user_id: userId }),
     };
     if (scopes && scopes.length) result.scope = scopes.join(' ');
     return result;
   }
 }
 
-export function createHttpApp(createServer, authToken) {
-  const oauth = new SimpleOAuthProvider(authToken);
+/**
+ * @param {function} createServer - Factory: (userId) => McpServer configured for that user
+ * @param {Map<string, {password: string, refreshToken: string}>} users - User configs keyed by userId
+ * @param {string} signingKey - Key for HMAC token signing
+ */
+export function createHttpApp(createServer, users, signingKey) {
+  const oauth = new SimpleOAuthProvider(signingKey);
   const app = express();
   const transports = new Map();
 
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '4mb' }));
   app.use(express.urlencoded({ extended: true }));
+
+  // Find user by password (timing-safe check against all users)
+  function findUserByPassword(password) {
+    let matchedUserId = null;
+    for (const [userId, config] of users) {
+      if (safeCompare(password || '', config.password)) {
+        matchedUserId = userId;
+      }
+    }
+    return matchedUserId;
+  }
 
   // OAuth metadata
   app.get('/.well-known/oauth-authorization-server', (req, res) => {
@@ -202,12 +217,13 @@ export function createHttpApp(createServer, authToken) {
 
   app.post('/login', (req, res) => {
     const { session, password } = req.body;
-    if (!safeCompare(password || '', authToken)) {
+    const userId = findUserByPassword(password);
+    if (!userId) {
       return res.status(403).send(
         renderLoginPage(session, '<p class="error">Invalid password. Please try again.</p>')
       );
     }
-    const result = oauth.completeAuthorize(session);
+    const result = oauth.completeAuthorize(session, userId);
     if (!result) {
       return res.status(400).send('Invalid or expired session.');
     }
@@ -232,7 +248,7 @@ export function createHttpApp(createServer, authToken) {
     res.status(400).json({ error: 'unsupported_grant_type' });
   });
 
-  // Bearer auth middleware
+  // Bearer auth middleware — attaches userId to req
   function requireAuth(req, res, next) {
     const serverUrl = `${req.protocol}://${req.get('host')}`;
     const wwwAuth = `Bearer resource_metadata="${serverUrl}/.well-known/oauth-protected-resource"`;
@@ -242,23 +258,26 @@ export function createHttpApp(createServer, authToken) {
       return res.status(401).json({ error: 'Missing bearer token' });
     }
     const token = authHeader.slice(7);
-    if (!oauth.validateToken(token)) {
+    const payload = oauth.validateToken(token);
+    if (!payload) {
       res.set('WWW-Authenticate', wwwAuth);
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
+    req.userId = payload.user_id;
     next();
   }
 
   // SSE endpoint
   app.get('/sse', requireAuth, async (req, res) => {
-    console.error('New SSE connection');
+    const userId = req.userId;
+    console.error(`New SSE connection for user: ${userId}`);
     const transport = new SSEServerTransport('/messages', res);
     transports.set(transport.sessionId, transport);
     res.on('close', () => {
-      console.error(`SSE connection closed: ${transport.sessionId}`);
+      console.error(`SSE connection closed: ${transport.sessionId} (user: ${userId})`);
       transports.delete(transport.sessionId);
     });
-    const server = createServer();
+    const server = createServer(userId);
     await server.connect(transport);
   });
 

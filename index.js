@@ -47,19 +47,18 @@ async function authenticateAndSaveCredentials() {
   return auth;
 }
 
-async function loadCredentials() {
-  // Try env vars first (for hosted deployment)
-  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN) {
-    console.error('Loading credentials from environment variables');
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-    auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-    return auth;
-  }
+// Create a Google Auth client from env vars
+function createGoogleAuthFromEnv(refreshToken) {
+  const auth = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+  auth.setCredentials({ refresh_token: refreshToken });
+  return auth;
+}
 
-  // Fall back to file-based credentials
+// Load credentials from file (for stdio/local mode)
+async function loadCredentialsFromFile() {
   console.error('Checking for saved credentials at:', TOKEN_PATH);
   if (!await fs.access(TOKEN_PATH).then(() => true).catch(() => false)) {
     console.error('Credentials file does not exist.');
@@ -99,15 +98,7 @@ async function loadCredentials() {
   return auth;
 }
 
-async function setupClassroomClient() {
-  const auth = await loadCredentials();
-  return google.classroom({
-    version: 'v1',
-    auth
-  });
-}
-
-function registerTools(server) {
+function registerTools(server, getClassroomClient) {
   server.tool("add",
     { a: z.number(), b: z.number() },
     async ({ a, b }) => ({
@@ -120,7 +111,7 @@ function registerTools(server) {
     async () => {
       try {
         console.error('Attempting to fetch courses...');
-        const classroom = await setupClassroomClient();
+        const classroom = await getClassroomClient();
         console.error('Classroom client initialized, fetching courses...');
         const courses = await classroom.courses.list();
         console.error('Courses fetched successfully:', courses.data.courses?.length || 0, 'courses found');
@@ -157,9 +148,8 @@ function registerTools(server) {
     async ({ courseId }) => {
       try {
         console.error(`Attempting to fetch details for course ${courseId}...`);
-        const classroom = await setupClassroomClient();
+        const classroom = await getClassroomClient();
 
-        // Get course details
         console.error('Fetching course details...');
         let courseDetails;
         try {
@@ -170,7 +160,6 @@ function registerTools(server) {
           throw new Error(`Failed to fetch course details: ${courseError.message}`);
         }
 
-        // Get course announcements
         console.error('Fetching course announcements...');
         let announcements = { data: { announcements: [] } };
         try {
@@ -240,9 +229,8 @@ function registerTools(server) {
     async ({ courseId }) => {
       try {
         console.error(`Attempting to fetch assignments for course ${courseId}...`);
-        const classroom = await setupClassroomClient();
+        const classroom = await getClassroomClient();
 
-        // Verify the course exists first
         try {
           await classroom.courses.get({ id: courseId });
           console.error('Course verified successfully');
@@ -251,7 +239,6 @@ function registerTools(server) {
           throw new Error(`Failed to verify course: ${courseError.message}`);
         }
 
-        // Get course work (assignments)
         console.error('Fetching course assignments...');
         let courseWork;
         try {
@@ -266,7 +253,6 @@ function registerTools(server) {
           throw new Error(`Failed to fetch assignments: ${workError.message}`);
         }
 
-        // Get student submissions for the assignments if available
         let submissions = [];
         try {
           if (courseWork.data.courseWork && courseWork.data.courseWork.length > 0) {
@@ -346,10 +332,34 @@ function registerTools(server) {
   );
 }
 
-function createMcpServer() {
+// Create an MCP server configured for a specific Google Auth client
+function createMcpServerWithAuth(googleAuth) {
   const server = new McpServer({ name: "class", version: "1.0.0" });
-  registerTools(server);
+  const getClassroomClient = async () => google.classroom({ version: 'v1', auth: googleAuth });
+  registerTools(server, getClassroomClient);
   return server;
+}
+
+// Parse USER_<NAME>_PASSWORD and USER_<NAME>_GOOGLE_REFRESH_TOKEN from env vars
+function parseUsersFromEnv() {
+  const users = new Map();
+  const userPattern = /^USER_(.+)_PASSWORD$/;
+
+  for (const [key, value] of Object.entries(process.env)) {
+    const match = key.match(userPattern);
+    if (match) {
+      const userName = match[1].toLowerCase();
+      const refreshToken = process.env[`USER_${match[1]}_GOOGLE_REFRESH_TOKEN`];
+      if (!refreshToken) {
+        console.error(`Warning: USER_${match[1]}_PASSWORD is set but USER_${match[1]}_GOOGLE_REFRESH_TOKEN is missing — skipping user ${userName}`);
+        continue;
+      }
+      users.set(userName, { password: value, refreshToken });
+      console.error(`Loaded user: ${userName}`);
+    }
+  }
+
+  return users;
 }
 
 async function main() {
@@ -370,26 +380,42 @@ async function main() {
     : 'stdio';
 
   if (transportArg === 'http') {
-    const authToken = process.env.MCP_AUTH_TOKEN;
-    if (!authToken) {
-      console.error('MCP_AUTH_TOKEN environment variable is required for HTTP transport');
-      process.exit(1);
-    }
-    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REFRESH_TOKEN) {
-      console.error('GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN environment variables are required for HTTP transport');
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      console.error('GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables are required for HTTP transport');
       process.exit(1);
     }
 
+    const users = parseUsersFromEnv();
+    if (users.size === 0) {
+      console.error('No users configured. Set USER_<NAME>_PASSWORD and USER_<NAME>_GOOGLE_REFRESH_TOKEN env vars.');
+      process.exit(1);
+    }
+
+    // Use first user's password as signing key (arbitrary but stable)
+    const signingKey = process.env.MCP_SIGNING_KEY || [...users.values()][0].password;
+
     const { createHttpApp } = await import('./oauth.js');
     const port = parseInt(process.env.PORT || process.env.MCP_SERVER_PORT || '8000', 10);
-    const app = createHttpApp(createMcpServer, authToken);
+
+    const app = createHttpApp(
+      (userId) => {
+        const user = users.get(userId);
+        const googleAuth = createGoogleAuthFromEnv(user.refreshToken);
+        return createMcpServerWithAuth(googleAuth);
+      },
+      users,
+      signingKey
+    );
+
     app.listen(port, '0.0.0.0', () => {
       console.error(`MCP server started in HTTP mode on http://0.0.0.0:${port}`);
+      console.error(`Users configured: ${[...users.keys()].join(', ')}`);
     });
   } else {
     try {
-      console.error('Starting MCP server...');
-      const server = createMcpServer();
+      console.error('Starting MCP server in stdio mode...');
+      const googleAuth = await loadCredentialsFromFile();
+      const server = createMcpServerWithAuth(googleAuth);
       const transport = new StdioServerTransport();
       await server.connect(transport);
       console.error('MCP server started successfully.');
